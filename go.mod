@@ -7,12 +7,16 @@ require (
 	github.com/go-git/go-git/v5 v5.4.2
 )
 
-require gopkg.in/src-d/go-git.v4 v4.13.1 // indirect
+require (
+	github.com/elastic/elastic-transport-go/v8 v8.1.0 // indirect
+	gopkg.in/src-d/go-git.v4 v4.13.1 // indirect
+)
 
 require (
 	github.com/Microsoft/go-winio v0.4.16 // indirect
 	github.com/ProtonMail/go-crypto v0.0.0-20210428141323-04723f9f07d7 // indirect
 	github.com/acomagu/bufpipe v1.0.3 // indirect
+	github.com/elastic/go-elasticsearch/v8 v8.4.0
 	github.com/emirpasic/gods v1.12.0 // indirect
 	github.com/go-git/gcfg v1.5.0 // indirect
 	github.com/go-git/go-git v4.7.0+incompatible
