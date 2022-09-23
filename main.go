@@ -12,11 +12,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	memfs "github.com/go-git/go-billy/v5/memfs"
+	// memfs "github.com/go-git/go-billy/v5/memfs"
 	git "github.com/go-git/go-git/v5"
 	diff "github.com/go-git/go-git/v5/plumbing/format/diff"
 	plumbingObject "github.com/go-git/go-git/v5/plumbing/object"
-	memory "github.com/go-git/go-git/v5/storage/memory"
+
+	// memory "github.com/go-git/go-git/v5/storage/memory"
 
 	elasticsearch "github.com/elastic/go-elasticsearch/v8"
 	esapi "github.com/elastic/go-elasticsearch/v8/esapi"
@@ -108,38 +109,110 @@ func getRemovedLines(patch diff.FilePatch) []string {
 
 func getExtension(file string) string {
 	var nameElements = strings.Split(file, ".")
+	if len(nameElements) == 1 {
+		return ""
+	}
 	return nameElements[len(nameElements)-1]
 }
 
 func main() {
 	var reponame = os.Getenv("REPO")
+	var incremental = os.Getenv("INCREMENTAL") == "true"
 	var branchname = os.Getenv("BRANCH")
+	var lastHash = ""
 	years, err := strconv.Atoi(os.Getenv("MAXAGE"))
 
 	var maxAge = time.Now().AddDate(-1*years, 0, 0)
 	fmt.Println(reponame + ", " + branchname)
-	fs := memfs.New()
+	// fs := memfs.New()
 
-	repo, err := git.Clone(memory.NewStorage(), fs, &git.CloneOptions{
-		URL: "file:///Users/joereuter/Clones/" + reponame,
-	})
+	// repo, err := git.Clone(memory.NewStorage(), fs, &git.CloneOptions{
+	// 	URL:        "file:///Users/joereuter/Clones/" + reponame,
+	// 	NoCheckout: true,
+	// })
+	repo, err := git.PlainOpen("/Users/joereuter/Clones/" + reponame)
 	CheckIfError(err)
 
 	branch, err := repo.Branch(branchname)
 	CheckIfError(err)
 
+	if incremental {
+		cfg := elasticsearch.Config{
+			Addresses: []string{
+				os.Getenv("ES"),
+			},
+		}
+
+		fmt.Println("Connect to check last indexed hash")
+		es, err := elasticsearch.NewClient(cfg)
+		CheckIfError(err)
+		res, err := es.Search(
+			es.Search.WithIndex("file_version_"+reponame),
+			es.Search.WithBody(bytes.NewReader([]byte(`{
+				"sort": [
+				  {
+					"date": {
+					  "order": "desc"
+					}
+				  }
+				],
+				
+				"size": 1
+			  }`))),
+		)
+		if res.IsError() {
+			var e map[string]interface{}
+			err := json.NewDecoder(res.Body).Decode(&e)
+			CheckIfError(err)
+		}
+
+		type envelopeResponse struct {
+			Took int
+			Hits struct {
+				Total struct {
+					Value int
+				}
+				Hits []struct {
+					Source struct {
+						Hash string
+					} `json:"_source"`
+				}
+			}
+		}
+
+		var r envelopeResponse
+		if err := json.NewDecoder(res.Body).Decode(&r); err != nil {
+			CheckIfError(err)
+		}
+
+		lastHash = r.Hits.Hits[0].Source.Hash
+		fmt.Println("Last indexed hash: " + lastHash)
+
+		res.Body.Close()
+	}
+
 	ref, err := repo.Reference(branch.Merge, true)
 	CheckIfError(err)
 
 	commit, err := repo.CommitObject(ref.Hash())
+	CheckIfError(err)
+
+	fmt.Println("Collecting commits")
 
 	var commits []*plumbingObject.Commit
 	for commit != nil {
-		commits = append(commits, commit)
-		commit, err = commit.Parent(0)
+		if len(commits)%250 == 0 {
+			fmt.Printf("%v commits collected\n", len(commits))
+		}
 		if commit.Author.When.Before(maxAge) {
 			break
 		}
+		commits = append(commits, commit)
+		if incremental && commit.Hash.String() == lastHash {
+			// add the last indexed hash so it can be diffed against it later
+			break
+		}
+		commit, err = commit.Parent(0)
 	}
 	fmt.Printf("%v commits\n", len(commits))
 
@@ -156,18 +229,19 @@ func main() {
 		fmt.Println("Connect")
 		es, err := elasticsearch.NewClient(cfg)
 		CheckIfError(err)
-		req := esapi.IndicesDeleteRequest{
-			Index:             []string{"file_version_" + reponame},
-			AllowNoIndices:    newTrue(),
-			IgnoreUnavailable: newTrue(),
-		}
-		fmt.Println("Delete old index")
-		res1, err := req.Do(context.Background(), es)
-		CheckIfError(err)
-		res1.Body.Close()
-		req2 := esapi.IndicesCreateRequest{
-			Index: "file_version_" + reponame,
-			Body: bytes.NewReader([]byte(`{
+		if !incremental {
+			req := esapi.IndicesDeleteRequest{
+				Index:             []string{"file_version_" + reponame},
+				AllowNoIndices:    newTrue(),
+				IgnoreUnavailable: newTrue(),
+			}
+			fmt.Println("Delete old index")
+			res1, err := req.Do(context.Background(), es)
+			CheckIfError(err)
+			res1.Body.Close()
+			req2 := esapi.IndicesCreateRequest{
+				Index: "file_version_" + reponame,
+				Body: bytes.NewReader([]byte(`{
 			"mappings": {
 			  "properties": {
 				"hash": {
@@ -281,11 +355,12 @@ func main() {
 			  }
 			}
 		  }`)),
+			}
+			fmt.Println("Create index " + "file_version_" + reponame)
+			res2, err := req2.Do(context.Background(), es)
+			CheckIfError(err)
+			res2.Body.Close()
 		}
-		fmt.Println("Create index " + "file_version_" + reponame)
-		res2, err := req2.Do(context.Background(), es)
-		CheckIfError(err)
-		res2.Body.Close()
 		fmt.Println("Starting bulk indexing")
 		var countSuccessful uint64 = 0
 		bi, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
@@ -349,74 +424,81 @@ func main() {
 			fmt.Printf("Commit %v\n", iteration)
 		}
 		if index == (len(commits) - 1) {
-			files, err := commit.Files()
-			CheckIfError(err)
-			files.ForEach(func(file *plumbingObject.File) error {
-				var nameElements = strings.Split(file.Name, "/")
-				var extension = getExtension(file.Name)
-				var dir0 = safeGet(nameElements, 0)
-				var dir1 = safeGet(nameElements, 1)
-				var dir2 = safeGet(nameElements, 2)
-				var dir3 = safeGet(nameElements, 3)
-				var dir4 = safeGet(nameElements, 4)
-				var dir5 = safeGet(nameElements, 5)
-				var dir6 = safeGet(nameElements, 6)
-				var dir7 = safeGet(nameElements, 7)
-				var dir8 = safeGet(nameElements, 8)
-				var dir9 = safeGet(nameElements, 9)
-				var newContent = ""
-
-				blob, err := repo.BlobObject(file.Hash)
-				var newSize = int(blob.Size)
+			if !incremental {
+				files, err := commit.Files()
 				CheckIfError(err)
-				isBinary, err := file.IsBinary()
-				CheckIfError(err)
-				if blob.Size != 0 && blob.Size < MAX_FILE_SIZE && !isBinary {
-					reader, err := blob.Reader()
-					CheckIfError(err)
-					var data = make([]byte, blob.Size)
-					_, err = reader.Read(data)
-					CheckIfError(err)
-					newContent = string(data)
-				}
+				files.ForEach(func(file *plumbingObject.File) error {
+					var nameElements = strings.Split(file.Name, "/")
+					var extension = getExtension(file.Name)
+					var dir0 = safeGet(nameElements, 0)
+					var dir1 = safeGet(nameElements, 1)
+					var dir2 = safeGet(nameElements, 2)
+					var dir3 = safeGet(nameElements, 3)
+					var dir4 = safeGet(nameElements, 4)
+					var dir5 = safeGet(nameElements, 5)
+					var dir6 = safeGet(nameElements, 6)
+					var dir7 = safeGet(nameElements, 7)
+					var dir8 = safeGet(nameElements, 8)
+					var dir9 = safeGet(nameElements, 9)
+					var newContent = ""
+					var newLoc = 0
 
-				var fileDescriptor = FileRevisionDescriptor{
-					Hash:        commit.Hash.String(),
-					AuthorName:  commit.Author.Name,
-					AuthorEmail: commit.Author.Email,
-					Date:        formattedCommitDate,
-					Message:     commit.Message,
-					Branch:      branchname,
-					Repository:  reponame,
-					Size:        newSize,
-					Loc:         len(strings.Split(newContent, "\n")),
-					Extension:   extension,
-					Dir0:        dir0,
-					Dir1:        dir1,
-					Dir2:        dir2,
-					Dir3:        dir3,
-					Dir4:        dir4,
-					Dir5:        dir5,
-					Dir6:        dir6,
-					Dir7:        dir7,
-					Dir8:        dir8,
-					Dir9:        dir9,
-					FileName:    file.Name,
-					Operation:   "add",
-					NewContent:  newContent,
-					OldContent:  "",
-					ValidWithin: DateRange{
-						Gte: formattedCommitDate,
-						Lte: "",
-					},
-					OldSize:      0,
-					OldLoc:       0,
-					LinesAdded:   []string{},
-					LinesRemoved: []string{},
-				}
-				currentFileDescriptors[file.Name] = fileDescriptor
-				return nil
-			})
+					blob, err := repo.BlobObject(file.Hash)
+					var newSize = int(blob.Size)
+					CheckIfError(err)
+					isBinary, err := file.IsBinary()
+					CheckIfError(err)
+					if blob.Size != 0 && !isBinary {
+						reader, err := blob.Reader()
+						CheckIfError(err)
+						var data = make([]byte, blob.Size)
+						_, err = reader.Read(data)
+						CheckIfError(err)
+						newContent = string(data)
+						newLoc = len(strings.Split(newContent, "\n")) - 1
+						if blob.Size > MAX_FILE_SIZE {
+							newContent = ""
+						}
+					}
+
+					var fileDescriptor = FileRevisionDescriptor{
+						Hash:        commit.Hash.String(),
+						AuthorName:  commit.Author.Name,
+						AuthorEmail: commit.Author.Email,
+						Date:        formattedCommitDate,
+						Message:     commit.Message,
+						Branch:      branchname,
+						Repository:  reponame,
+						Size:        newSize,
+						Loc:         newLoc,
+						Extension:   extension,
+						Dir0:        dir0,
+						Dir1:        dir1,
+						Dir2:        dir2,
+						Dir3:        dir3,
+						Dir4:        dir4,
+						Dir5:        dir5,
+						Dir6:        dir6,
+						Dir7:        dir7,
+						Dir8:        dir8,
+						Dir9:        dir9,
+						FileName:    file.Name,
+						Operation:   "add",
+						NewContent:  newContent,
+						OldContent:  "",
+						ValidWithin: DateRange{
+							Gte: formattedCommitDate,
+							Lte: "",
+						},
+						OldSize:      0,
+						OldLoc:       0,
+						LinesAdded:   []string{},
+						LinesRemoved: []string{},
+					}
+					currentFileDescriptors[file.Name] = fileDescriptor
+					return nil
+				})
+			}
 		} else {
 			var prevCommit = commits[index+1]
 			prevTree, err := prevCommit.Tree()
@@ -429,13 +511,15 @@ func main() {
 				from, to := element.Files()
 				var oldContent = ""
 				var oldSize = 0
+				var oldLoc = 0
 				var newContent = ""
 				var newSize = 0
+				var newLoc = 0
 				if from != nil {
 					blob, err := repo.BlobObject(from.Hash())
 					oldSize = int(blob.Size)
 					CheckIfError(err)
-					if blob.Size < MAX_FILE_SIZE && !element.IsBinary() {
+					if !element.IsBinary() {
 						reader, err := blob.Reader()
 						CheckIfError(err)
 						var data = make([]byte, blob.Size)
@@ -443,6 +527,10 @@ func main() {
 						// TODO check what's the cause here
 						if err == nil {
 							oldContent = string(data)
+							oldLoc = len(strings.Split(oldContent, "\n")) - 1
+							if blob.Size > MAX_FILE_SIZE {
+								oldContent = ""
+							}
 						}
 					}
 				}
@@ -450,7 +538,7 @@ func main() {
 					blob, err := repo.BlobObject(to.Hash())
 					newSize = int(blob.Size)
 					CheckIfError(err)
-					if blob.Size < MAX_FILE_SIZE && !element.IsBinary() {
+					if !element.IsBinary() {
 						reader, err := blob.Reader()
 						CheckIfError(err)
 						var data = make([]byte, blob.Size)
@@ -458,6 +546,10 @@ func main() {
 						// TODO check what's the cause here
 						if err == nil {
 							newContent = string(data)
+							newLoc = len(strings.Split(newContent, "\n")) - 1
+							if blob.Size > MAX_FILE_SIZE {
+								newContent = ""
+							}
 						}
 					}
 				}
@@ -479,7 +571,8 @@ func main() {
 				var dir7 = safeGet(nameElements, 7)
 				var dir8 = safeGet(nameElements, 8)
 				var dir9 = safeGet(nameElements, 9)
-				if from != nil && to != nil {
+				if from != nil && to != nil && from.Path() == to.Path() {
+					// modify file in place
 					var existingDescriptor = currentFileDescriptors[to.Path()]
 					existingDescriptor.ValidWithin.Lte = formattedCommitDate
 					var modifyRevision = FileRevisionDescriptor{
@@ -491,7 +584,7 @@ func main() {
 						Branch:      branchname,
 						Repository:  reponame,
 						Size:        newSize,
-						Loc:         len(strings.Split(newContent, "\n")),
+						Loc:         newLoc,
 						Extension:   extension,
 						Dir0:        dir0,
 						Dir1:        dir1,
@@ -513,15 +606,105 @@ func main() {
 							Lte: "",
 						},
 						OldSize:      oldSize,
-						OldLoc:       len(strings.Split(oldContent, "\n")),
+						OldLoc:       oldLoc,
 						LinesAdded:   getAddedLines(element),
 						LinesRemoved: getRemovedLines(element),
 					}
-					// if to.Path() == "dist/rename-me.js" {
-					// 	fmt.Println(modifyRevision)
-					// }
 					writeQueue <- existingDescriptor
 					currentFileDescriptors[to.Path()] = modifyRevision
+				}
+				if from != nil && to != nil && from.Path() != to.Path() {
+					// move file (remove old and add new)
+					var existingDescriptor = currentFileDescriptors[from.Path()]
+					existingDescriptor.ValidWithin.Lte = formattedCommitDate
+					var addRevision = FileRevisionDescriptor{
+						Hash:        commit.Hash.String(),
+						AuthorName:  commit.Author.Name,
+						AuthorEmail: commit.Author.Email,
+						Date:        formattedCommitDate,
+						Message:     commit.Message,
+						Branch:      branchname,
+						Repository:  reponame,
+						Size:        newSize,
+						Loc:         newLoc,
+						Extension:   extension,
+						Dir0:        dir0,
+						Dir1:        dir1,
+						Dir2:        dir2,
+						Dir3:        dir3,
+						Dir4:        dir4,
+						Dir5:        dir5,
+						Dir6:        dir6,
+						Dir7:        dir7,
+						Dir8:        dir8,
+						Dir9:        dir9,
+						FileName:    to.Path(),
+						OldPath:     from.Path(),
+						Operation:   "add",
+						NewContent:  newContent,
+						OldContent:  "",
+						ValidWithin: DateRange{
+							Gte: formattedCommitDate,
+							Lte: "",
+						},
+						OldSize:      0,
+						OldLoc:       0,
+						LinesAdded:   []string{},
+						LinesRemoved: []string{},
+					}
+					writeQueue <- existingDescriptor
+					currentFileDescriptors[to.Path()] = addRevision
+
+					path = from.Path()
+					var nameElements = strings.Split(path, "/")
+					var extension = getExtension(path)
+					var dir0 = safeGet(nameElements, 0)
+					var dir1 = safeGet(nameElements, 1)
+					var dir2 = safeGet(nameElements, 2)
+					var dir3 = safeGet(nameElements, 3)
+					var dir4 = safeGet(nameElements, 4)
+					var dir5 = safeGet(nameElements, 5)
+					var dir6 = safeGet(nameElements, 6)
+					var dir7 = safeGet(nameElements, 7)
+					var dir8 = safeGet(nameElements, 8)
+					var dir9 = safeGet(nameElements, 9)
+					var deleteRevision = FileRevisionDescriptor{
+						Hash:         commit.Hash.String(),
+						AuthorName:   commit.Author.Name,
+						AuthorEmail:  commit.Author.Email,
+						Date:         formattedCommitDate,
+						Message:      commit.Message,
+						Branch:       branchname,
+						Repository:   reponame,
+						Size:         0,
+						Loc:          0,
+						Extension:    extension,
+						Dir0:         dir0,
+						Dir1:         dir1,
+						Dir2:         dir2,
+						Dir3:         dir3,
+						Dir4:         dir4,
+						Dir5:         dir5,
+						Dir6:         dir6,
+						Dir7:         dir7,
+						Dir8:         dir8,
+						Dir9:         dir9,
+						OldPath:      "",
+						FileName:     from.Path(),
+						Operation:    "remove",
+						NewContent:   "",
+						OldContent:   oldContent,
+						OldSize:      oldSize,
+						OldLoc:       oldLoc,
+						LinesAdded:   []string{},
+						LinesRemoved: []string{},
+						ValidWithin: DateRange{
+							Gte: formattedCommitDate,
+							Lte: formattedCommitDate,
+						},
+					}
+					writeQueue <- deleteRevision
+					delete(currentFileDescriptors, from.Path())
 				}
 				if from != nil && to == nil {
 					var existingDescriptor = currentFileDescriptors[from.Path()]
@@ -553,7 +736,7 @@ func main() {
 						NewContent:   "",
 						OldContent:   oldContent,
 						OldSize:      oldSize,
-						OldLoc:       len(strings.Split(oldContent, "\n")),
+						OldLoc:       oldLoc,
 						LinesAdded:   []string{},
 						LinesRemoved: []string{},
 						ValidWithin: DateRange{
@@ -575,7 +758,7 @@ func main() {
 						Branch:      branchname,
 						Repository:  reponame,
 						Size:        newSize,
-						Loc:         len(strings.Split(newContent, "\n")),
+						Loc:         newLoc,
 						Extension:   extension,
 						Dir0:        dir0,
 						Dir1:        dir1,
