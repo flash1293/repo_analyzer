@@ -19,8 +19,4 @@ ES="cluster with auth in url" REPO="repo name" BRANCH="branch" MAXAGE="maximum a
 We delete and re-index the index
 
 Todo:
-* Fix loc counting
-* try either partial cloning or load from host system
-* Run for kibana 20k commits
-* Allow incremental updates
-* Research mitigations for panic in diffing code
+* Research mitigations for panic in diffing code (sometimes the git library seems to throw up)
